@@ -54,8 +54,15 @@ actor MacNodeBrowserProxy {
 
     func request(paramsJSON: String?) async throws -> String {
         let params = try Self.decodeRequestParams(from: paramsJSON)
-        let request = try Self.makeRequest(params: params, endpoint: self.endpointProvider())
-        let (data, response) = try await self.performRequest(request)
+        let endpoint = self.endpointProvider()
+        let request = try Self.makeRequest(params: params, endpoint: endpoint)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await self.performRequest(request)
+        } catch {
+            throw Self.unavailableError(endpoint: endpoint, cause: error)
+        }
         let http = try Self.requireHTTPResponse(response)
         guard (200..<300).contains(http.statusCode) else {
             throw NSError(domain: "MacNodeBrowserProxy", code: http.statusCode, userInfo: [
@@ -122,7 +129,7 @@ actor MacNodeBrowserProxy {
             }
         }
         let profile = params.profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !profile.isEmpty && !queryItems.contains(where: { $0.name == "profile" }) {
+        if !profile.isEmpty, !queryItems.contains(where: { $0.name == "profile" }) {
             queryItems.append(URLQueryItem(name: "profile", value: profile))
         }
         if !queryItems.isEmpty {
@@ -146,8 +153,10 @@ actor MacNodeBrowserProxy {
             request.setValue(password, forHTTPHeaderField: "x-openclaw-password")
         }
 
-        if method != "GET", let body = params.body?.value {
-            request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.fragmentsAllowed])
+        if method != "GET", let body = params.body {
+            request.httpBody = try JSONSerialization.data(
+                withJSONObject: body.foundationValue,
+                options: [.fragmentsAllowed])
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
 
@@ -163,6 +172,19 @@ actor MacNodeBrowserProxy {
         return http
     }
 
+    private static func unavailableError(endpoint: Endpoint, cause: Error) -> NSError {
+        let url = endpoint.baseURL.absoluteString
+        let message = """
+        UNAVAILABLE: macOS app node could not reach the local browser control service at \(url). \
+        In remote mode, browser control is owned by the CLI node-host; start `openclaw node start` \
+        on this Mac and target that browser node. Underlying error: \(cause.localizedDescription)
+        """
+        return NSError(domain: "MacNodeBrowserProxy", code: 9, userInfo: [
+            NSLocalizedDescriptionKey: message,
+            NSUnderlyingErrorKey: cause,
+        ])
+    }
+
     private static func httpErrorMessage(statusCode: Int, data: Data) -> String {
         if let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) as? [String: Any],
            let error = object["error"] as? String,
@@ -172,7 +194,7 @@ actor MacNodeBrowserProxy {
         }
         if let text = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-           !text.isEmpty
+            !text.isEmpty
         {
             return text
         }

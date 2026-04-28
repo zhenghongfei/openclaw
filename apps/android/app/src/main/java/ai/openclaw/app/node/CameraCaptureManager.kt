@@ -111,7 +111,7 @@ class CameraCaptureManager(private val context: Context) {
       provider.unbindAll()
       provider.bindToLifecycle(owner, selector, capture)
 
-      val (bytes, orientation) = capture.takeJpegWithExif(context.mainExecutor())
+      val (bytes, orientation) = capture.takeJpegWithExif(context.mainExecutor(), context.cacheDir)
       val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         ?: throw IllegalStateException("UNAVAILABLE: failed to decode captured image")
       val rotated = rotateBitmapByExif(decoded, orientation)
@@ -121,42 +121,48 @@ class CameraCaptureManager(private val context: Context) {
             (rotated.height.toDouble() * (maxWidth.toDouble() / rotated.width.toDouble()))
               .toInt()
               .coerceAtLeast(1)
-          rotated.scale(maxWidth, h)
+          val s = rotated.scale(maxWidth, h)
+          if (s !== rotated) rotated.recycle()
+          s
         } else {
           rotated
         }
 
-      val maxPayloadBytes = 5 * 1024 * 1024
-      // Base64 inflates payloads by ~4/3; cap encoded bytes so the payload stays under 5MB (API limit).
-      val maxEncodedBytes = (maxPayloadBytes / 4) * 3
-      val result =
-        JpegSizeLimiter.compressToLimit(
-          initialWidth = scaled.width,
-          initialHeight = scaled.height,
-          startQuality = (quality * 100.0).roundToInt().coerceIn(10, 100),
-          maxBytes = maxEncodedBytes,
-          encode = { width, height, q ->
-            val bitmap =
-              if (width == scaled.width && height == scaled.height) {
-                scaled
-              } else {
-                scaled.scale(width, height)
+      try {
+        val maxPayloadBytes = 5 * 1024 * 1024
+        // Base64 inflates payloads by ~4/3; cap encoded bytes so the payload stays under 5MB (API limit).
+        val maxEncodedBytes = (maxPayloadBytes / 4) * 3
+        val result =
+          JpegSizeLimiter.compressToLimit(
+            initialWidth = scaled.width,
+            initialHeight = scaled.height,
+            startQuality = (quality * 100.0).roundToInt().coerceIn(10, 100),
+            maxBytes = maxEncodedBytes,
+            encode = { width, height, q ->
+              val bitmap =
+                if (width == scaled.width && height == scaled.height) {
+                  scaled
+                } else {
+                  scaled.scale(width, height)
+                }
+              val out = ByteArrayOutputStream()
+              if (!bitmap.compress(Bitmap.CompressFormat.JPEG, q, out)) {
+                if (bitmap !== scaled) bitmap.recycle()
+                throw IllegalStateException("UNAVAILABLE: failed to encode JPEG")
               }
-            val out = ByteArrayOutputStream()
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, q, out)) {
-              if (bitmap !== scaled) bitmap.recycle()
-              throw IllegalStateException("UNAVAILABLE: failed to encode JPEG")
-            }
-            if (bitmap !== scaled) {
-              bitmap.recycle()
-            }
-            out.toByteArray()
-          },
+              if (bitmap !== scaled) {
+                bitmap.recycle()
+              }
+              out.toByteArray()
+            },
+          )
+        val base64 = Base64.encodeToString(result.bytes, Base64.NO_WRAP)
+        Payload(
+          """{"format":"jpg","base64":"$base64","width":${result.width},"height":${result.height}}""",
         )
-      val base64 = Base64.encodeToString(result.bytes, Base64.NO_WRAP)
-      Payload(
-        """{"format":"jpg","base64":"$base64","width":${result.width},"height":${result.height}}""",
-      )
+      } finally {
+        scaled.recycle()
+      }
     }
 
   @SuppressLint("MissingPermission")
@@ -208,7 +214,7 @@ class CameraCaptureManager(private val context: Context) {
       android.util.Log.w("CameraCaptureManager", "clip: warming up camera 1.5s...")
       kotlinx.coroutines.delay(1_500)
 
-      val file = File.createTempFile("openclaw-clip-", ".mp4")
+      val file = File.createTempFile("openclaw-clip-", ".mp4", context.cacheDir)
       val outputOptions = FileOutputOptions.Builder(file).build()
 
       val finalized = kotlinx.coroutines.CompletableDeferred<VideoRecordEvent.Finalize>()
@@ -386,9 +392,9 @@ private suspend fun Context.cameraProvider(): ProcessCameraProvider =
   }
 
 /** Returns (jpegBytes, exifOrientation) so caller can rotate the decoded bitmap. */
-private suspend fun ImageCapture.takeJpegWithExif(executor: Executor): Pair<ByteArray, Int> =
+private suspend fun ImageCapture.takeJpegWithExif(executor: Executor, tempDir: File): Pair<ByteArray, Int> =
   suspendCancellableCoroutine { cont ->
-    val file = File.createTempFile("openclaw-snap-", ".jpg")
+    val file = File.createTempFile("openclaw-snap-", ".jpg", tempDir)
     val options = ImageCapture.OutputFileOptions.Builder(file).build()
     takePicture(
       options,

@@ -6,7 +6,7 @@ import OSLog
 
 private let gatewayConnectionLogger = Logger(subsystem: "ai.openclaw", category: "gateway.connection")
 
-enum GatewayAgentChannel: String, Codable, CaseIterable, Sendable {
+enum GatewayAgentChannel: String, Codable, CaseIterable {
     case last
     case whatsapp
     case telegram
@@ -33,7 +33,7 @@ enum GatewayAgentChannel: String, Codable, CaseIterable, Sendable {
     }
 }
 
-struct GatewayAgentInvocation: Sendable {
+struct GatewayAgentInvocation {
     var message: String
     var sessionKey: String = "main"
     var thinking: String?
@@ -42,6 +42,7 @@ struct GatewayAgentInvocation: Sendable {
     var channel: GatewayAgentChannel = .last
     var timeoutSeconds: Int?
     var idempotencyKey: String = UUID().uuidString
+    var voiceWakeTrigger: String?
 }
 
 /// Single, shared Gateway websocket connection for the whole app.
@@ -53,7 +54,7 @@ actor GatewayConnection {
 
     typealias Config = (url: URL, token: String?, password: String?)
 
-    enum Method: String, Sendable {
+    enum Method: String {
         case agent
         case status
         case setHeartbeats = "set-heartbeats"
@@ -70,6 +71,7 @@ actor GatewayConnection {
         case wizardStatus = "wizard.status"
         case talkConfig = "talk.config"
         case talkMode = "talk.mode"
+        case talkSpeak = "talk.speak"
         case webLoginStart = "web.login.start"
         case webLoginWait = "web.login.wait"
         case channelsLogout = "channels.logout"
@@ -428,9 +430,9 @@ actor GatewayConnection {
 // MARK: - Typed gateway API
 
 extension GatewayConnection {
-    struct ConfigGetSnapshot: Decodable, Sendable {
-        struct SnapshotConfig: Decodable, Sendable {
-            struct Session: Decodable, Sendable {
+    struct ConfigGetSnapshot: Decodable {
+        struct SnapshotConfig: Decodable {
+            struct Session: Decodable {
                 let mainKey: String?
                 let scope: String?
             }
@@ -498,6 +500,10 @@ extension GatewayConnection {
         if let timeout = invocation.timeoutSeconds {
             params["timeout"] = AnyCodable(timeout)
         }
+        if let trigger = invocation.voiceWakeTrigger {
+            params["voiceWakeTrigger"] = AnyCodable(
+                trigger.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
 
         do {
             try await self.requestVoid(method: .agent, params: params)
@@ -558,12 +564,16 @@ extension GatewayConnection {
     func skillsInstall(
         name: String,
         installId: String,
+        dangerouslyForceUnsafeInstall: Bool? = nil,
         timeoutMs: Int? = nil) async throws -> SkillInstallResult
     {
         var params: [String: AnyCodable] = [
             "name": AnyCodable(name),
             "installId": AnyCodable(installId),
         ]
+        if let dangerouslyForceUnsafeInstall {
+            params["dangerouslyForceUnsafeInstall"] = AnyCodable(dangerouslyForceUnsafeInstall)
+        }
         if let timeoutMs {
             params["timeoutMs"] = AnyCodable(timeoutMs)
         }
@@ -614,11 +624,13 @@ extension GatewayConnection {
     func chatHistory(
         sessionKey: String,
         limit: Int? = nil,
+        maxChars: Int? = nil,
         timeoutMs: Int? = nil) async throws -> OpenClawChatHistoryPayload
     {
         let resolvedKey = self.canonicalizeSessionKey(sessionKey)
         var params: [String: AnyCodable] = ["sessionKey": AnyCodable(resolvedKey)]
         if let limit { params["limit"] = AnyCodable(limit) }
+        if let maxChars { params["maxChars"] = AnyCodable(maxChars) }
         let timeout = timeoutMs.map { Double($0) }
         return try await self.requestDecoded(
             method: .chatHistory,
@@ -729,7 +741,7 @@ extension GatewayConnection {
 
     // MARK: - Cron
 
-    struct CronSchedulerStatus: Decodable, Sendable {
+    struct CronSchedulerStatus: Decodable {
         let enabled: Bool
         let storePath: String
         let jobs: Int
